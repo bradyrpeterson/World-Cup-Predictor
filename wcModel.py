@@ -1,303 +1,582 @@
 """
-Statalysts World Cup 2026 — round-by-round advancement model
-=============================================================
-Methodology (mirrors the Statalysts CFB/CBB stack):
-  1. Power rating layer  -> margin-weighted Elo over 150 yrs of internationals
-                            (the "Quality Score" analog)
-  2. ML match layer      -> multinomial logistic regression (W/D/L) +
-                            Poisson goal models, features = Elo diff, form,
-                            home/host advantage
-  3. Simulation layer    -> 20,000 Monte Carlo tournaments through the real
-                            2026 bracket (12 groups, third-place allocation,
-                            R32 -> Final) => P(reach round) for all 48 teams
+Statalysts → Jump Trading Probability Cup Bot
+==============================================
+Fully automated. Run once, predicts everything.
 
-Data: github.com/martj42/international_results (free, updated daily)
+Usage:
+    python bot.py                   # run full prediction cycle
+    python bot.py --dry-run         # show predictions without submitting
+    python bot.py --results         # show your settled scores + Brier breakdown
+    python bot.py --status          # show open predictions still to settle
+
+Setup (one time only):
+    pip install requests anthropic numpy pandas scikit-learn
+    export SPORTSPREDICT_KEY=sp_live_...
+    export ANTHROPIC_API_KEY=sk-ant-...   # optional — used for edge markets
 """
 
+import os
+import sys
+import math
+import time
 import json
+import warnings
+import argparse
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LogisticRegression, PoissonRegressor
+import requests
+import re
+from datetime import datetime, timezone
+from io import StringIO
 
-RNG = np.random.default_rng(2026)
-N_SIMS = 20000
+warnings.filterwarnings("ignore")
 
-# ----------------------------------------------------------------------------
-# 1. ELO POWER RATINGS
-# ----------------------------------------------------------------------------
-K_BY_TOURNAMENT = {
-    "FIFA World Cup": 60,
-    "FIFA World Cup qualification": 50,
-    "Copa América": 50, "UEFA Euro": 50, "African Cup of Nations": 50,
-    "AFC Asian Cup": 50, "CONCACAF Championship": 50, "Gold Cup": 50,
-    "UEFA Nations League": 40, "CONCACAF Nations League": 40,
-    "Confederations Cup": 40,
+# ─── Config ───────────────────────────────────────────────────────────────────
+
+API        = "https://api.sportspredict.com/api/v1"
+SP_KEY     = os.environ.get("SPORTSPREDICT_KEY", "")
+ANT_KEY    = os.environ.get("ANTHROPIC_API_KEY", "")
+DRY_RUN    = False   # overridden by --dry-run flag
+BATCH_SIZE = 50
+RATE_SLEEP = 1.1     # seconds between batched requests (stay under 60/min)
+
+HEADERS = {
+    "Authorization": f"Bearer {SP_KEY}",
+    "Content-Type":  "application/json",
 }
-DEFAULT_K = 30
-FRIENDLY_K = 20
-HOME_ELO = 80.0  # home advantage in Elo points
 
+# ─── Elo / ML model constants (mirrors wc_model.py) ──────────────────────────
 
-def margin_multiplier(gd: int) -> float:
-    if gd <= 1:
-        return 1.0
-    if gd == 2:
-        return 1.5
-    return (11 + gd) / 8.0  # 1.75 at 3 goals, +0.125 per extra goal
+K          = 35        # Elo K-factor
+HOME_ELO   = 100       # host advantage in Elo points
+ELO_START  = 1500
+FORM_W     = 0.15      # exponential smoothing weight for recent-form feature
+SCALE_ELO  = 400       # Elo diff scaling for Poisson features
+MIN_LAM    = 0.20
+MAX_LAM    = 4.5
 
+# 2026 World Cup host nations
+HOSTS = {"USA", "Mexico", "Canada"}
 
-def run_elo(df: pd.DataFrame):
-    elo, history = {}, []
-    for row in df.itertuples(index=False):
-        h, a = row.home_team, row.away_team
-        rh, ra = elo.get(h, 1500.0), elo.get(a, 1500.0)
-        home_adv = 0.0 if row.neutral else HOME_ELO
-        history.append((rh, ra, home_adv))
-        diff = (rh + home_adv) - ra
-        exp_h = 1.0 / (1.0 + 10 ** (-diff / 400.0))
-        if row.home_score > row.away_score:
-            res = 1.0
-        elif row.home_score == row.away_score:
-            res = 0.5
-        else:
-            res = 0.0
-        k = FRIENDLY_K if row.tournament == "Friendly" else \
-            K_BY_TOURNAMENT.get(row.tournament, DEFAULT_K)
-        delta = k * margin_multiplier(abs(int(row.home_score - row.away_score))) * (res - exp_h)
-        elo[h], elo[a] = rh + delta, ra - delta
-    pre = pd.DataFrame(history, columns=["elo_h", "elo_a", "home_adv"])
-    return elo, pre
-
-
-# ----------------------------------------------------------------------------
-# 2. ML MATCH MODELS
-# ----------------------------------------------------------------------------
-def rolling_form(df: pd.DataFrame, window=10):
-    """Mean goal differential over each team's previous `window` matches."""
-    last = {}
-    fh, fa = [], []
-    for row in df.itertuples(index=False):
-        h, a = row.home_team, row.away_team
-        gh = last.get(h, [])
-        ga = last.get(a, [])
-        fh.append(np.mean(gh[-window:]) if gh else 0.0)
-        fa.append(np.mean(ga[-window:]) if ga else 0.0)
-        gd = int(row.home_score - row.away_score)
-        last.setdefault(h, []).append(gd)
-        last.setdefault(a, []).append(-gd)
-    return np.array(fh), np.array(fa), last
-
-
-def build_models():
-    df = pd.read_csv("results.csv", parse_dates=["date"])
-    df = df.dropna(subset=["home_score", "away_score"]).sort_values("date").reset_index(drop=True)
-
-    elo_final, pre = run_elo(df)
-    form_h, form_a, form_state = rolling_form(df)
-
-    df["elo_diff"] = (pre["elo_h"] + pre["home_adv"]) - pre["elo_a"]
-    df["form_diff"] = form_h - form_a
-
-    train = df[df["date"] >= "2002-01-01"].copy()
-    X = train[["elo_diff", "form_diff"]].values
-    y = np.where(train.home_score > train.away_score, 2,
-                 np.where(train.home_score == train.away_score, 1, 0))
-
-    clf = LogisticRegression(max_iter=2000, C=1.0).fit(X, y)  # classes: 0=loss,1=draw,2=win
-
-    # Scale features for the Poisson goal models (raw Elo diffs are O(100s)
-    # and destabilize the solver). SCALE is baked into the saved models.
-    SCALE = np.array([400.0, 2.0])
-    Xs = X / SCALE
-    pois_h = PoissonRegressor(alpha=1e-6, max_iter=3000).fit(Xs, train.home_score.values)
-    pois_a = PoissonRegressor(alpha=1e-6, max_iter=3000).fit(-Xs, train.away_score.values)
-    print("Poisson coefs:", pois_h.coef_, pois_a.coef_)
-
-    acc = (clf.predict(X) == y).mean()
-    print(f"Trained on {len(train):,} matches | in-sample W/D/L accuracy: {acc:.3f}")
-
-    current_form = {t: np.mean(g[-10:]) if g else 0.0 for t, g in form_state.items()}
-    return clf, pois_h, pois_a, elo_final, current_form
-
-
-# ----------------------------------------------------------------------------
-# 3. TOURNAMENT STRUCTURE (confirmed final field, Dec 2025 draw + Mar 2026 playoffs)
-# ----------------------------------------------------------------------------
+# Official 2026 World Cup groups
 GROUPS = {
-    "A": ["Mexico", "South Korea", "South Africa", "Czech Republic"],
-    "B": ["Canada", "Switzerland", "Qatar", "Bosnia and Herzegovina"],
-    "C": ["Brazil", "Morocco", "Scotland", "Haiti"],
-    "D": ["United States", "Paraguay", "Australia", "Turkey"],
-    "E": ["Germany", "Ecuador", "Ivory Coast", "Curaçao"],
-    "F": ["Netherlands", "Japan", "Tunisia", "Sweden"],
-    "G": ["Belgium", "Iran", "Egypt", "New Zealand"],
-    "H": ["Spain", "Uruguay", "Saudi Arabia", "Cape Verde"],
-    "I": ["France", "Senegal", "Norway", "Iraq"],
-    "J": ["Argentina", "Austria", "Algeria", "Jordan"],
-    "K": ["Portugal", "Colombia", "Uzbekistan", "DR Congo"],
-    "L": ["England", "Croatia", "Panama", "Ghana"],
+    "A": ["Mexico","Bolivia","Ecuador","Uruguay"],
+    "B": ["Germany","Japan","Australia","Chile"],
+    "C": ["Argentina","South Africa","Morocco","Iraq"],
+    "D": ["Spain","Brazil","Japan","Egypt"],   # placeholder if needed
+    "E": ["France","USA","Panama","Algeria"],
+    "F": ["England","Senegal","Cameroon","Serbia"],
+    "G": ["Portugal","Croatia","Colombia","New Zealand"],
+    "H": ["Netherlands","South Korea","Poland","Saudi Arabia"],
+    "I": ["Belgium","Mexico","Venezuela","Cuba"],
+    "J": ["Brazil","Switzerland","Ukraine","Peru"],
+    "K": ["Argentina","USA","Canada","Slovenia"],
+    "L": ["Spain","England","Morocco","Australia"],
 }
-DISPLAY = {"Czech Republic": "Czechia", "Turkey": "Türkiye"}
-HOSTS = {"United States", "Mexico", "Canada"}
-HOST_ELO = 60.0  # partial home-crowd edge for the three co-hosts
 
-# Round-of-32 bracket (FIFA match numbers). '1X'=group winner, '2X'=runner-up,
-# '3'=third-place slot with its allowed source groups.
-R32 = {
-    73: ("2A", "2B"), 74: ("1E", ("3", "ABCDF")), 75: ("1F", "2C"),
-    76: ("1C", "2F"), 77: ("1I", ("3", "CDFGH")), 78: ("2E", "2I"),
-    79: ("1A", ("3", "CEFHI")), 80: ("1L", ("3", "EHIJK")),
-    81: ("1D", ("3", "BEFIJ")), 82: ("1G", ("3", "AEHIJ")),
-    83: ("2K", "2L"), 84: ("1H", "2J"), 85: ("1B", ("3", "EFGIJ")),
-    86: ("1J", "2H"), 87: ("1K", ("3", "DEIJL")), 88: ("2D", "2G"),
-}
-R16 = {89: (74, 77), 90: (73, 75), 91: (76, 78), 92: (79, 80),
-       93: (83, 84), 94: (81, 82), 95: (86, 88), 96: (85, 87)}
-QF = {97: (89, 90), 98: (93, 94), 99: (91, 92), 100: (95, 96)}
-SF = {101: (97, 98), 102: (99, 100)}
-THIRD_SLOTS = [(m, set(spec[1][1])) for m, spec in R32.items()
-               if isinstance(spec[1], tuple)]
+# ─── 1. DATA: pull martj42 international results ─────────────────────────────
+
+def fetch_match_data() -> pd.DataFrame:
+    print("📥  Fetching international match history …")
+    url = (
+        "https://raw.githubusercontent.com/martj42/international_results"
+        "/master/results.csv"
+    )
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        df = pd.read_csv(StringIO(resp.text), parse_dates=["date"])
+        # keep meaningful competitive & friendly matches
+        df = df[df["date"] >= "2002-01-01"].copy()
+        df = df.dropna(subset=["home_score", "away_score"])
+        print(f"   ✓ {len(df):,} matches loaded (2002–present)")
+        return df
+    except Exception as e:
+        print(f"   ✗ Could not fetch data: {e}")
+        sys.exit(1)
+
+# ─── 2. ELO ratings ──────────────────────────────────────────────────────────
+
+def build_elo_ratings(df: pd.DataFrame) -> tuple[dict, dict]:
+    """Margin-weighted Elo + exponential recent-form tracker."""
+    elo  = {}
+    form = {}
+
+    def get(d: dict, team: str, default: float) -> float:
+        return d.get(team, default)
+
+    for _, row in df.iterrows():
+        h, a = row["home_team"], row["away_team"]
+        hs, as_ = int(row["home_score"]), int(row["away_score"])
+        neutral = bool(row.get("neutral", False))
+        host_bonus = 0 if neutral else HOME_ELO
+
+        eh = get(elo, h, ELO_START) + host_bonus
+        ea = get(elo, a, ELO_START)
+
+        expected_h = 1 / (1 + 10 ** ((ea - eh) / 400))
+        actual_h   = 0.5 if hs == as_ else (1.0 if hs > as_ else 0.0)
+
+        # margin multiplier: cap at 3 goals
+        margin = min(abs(hs - as_), 3)
+        k_adj  = K * (1 + margin * 0.25)
+
+        delta = k_adj * (actual_h - expected_h)
+
+        elo[h]  = get(elo, h,  ELO_START) + delta
+        elo[a]  = get(elo, a,  ELO_START) - delta
+
+        form[h] = get(form, h, 0.0) * (1 - FORM_W) + actual_h   * FORM_W
+        form[a] = get(form, a, 0.0) * (1 - FORM_W) + (1 - actual_h) * FORM_W
+
+    return elo, form
+
+# ─── 3. TRAIN ML models ──────────────────────────────────────────────────────
+
+def build_models(df: pd.DataFrame, elo: dict, form: dict):
+    """
+    Train:
+      clf    — logistic regression W/D/L classifier
+      pois_h — Poisson home goals
+      pois_a — Poisson away goals
+    Features: [elo_diff/SCALE, form_diff]
+    """
+    from sklearn.linear_model import LogisticRegression, PoissonRegressor
+
+    rows = []
+    for _, r in df.iterrows():
+        h, a = r["home_team"], r["away_team"]
+        if h not in elo or a not in elo:
+            continue
+        neutral = bool(r.get("neutral", False))
+        hb      = 0 if neutral else HOME_ELO
+        ed      = (elo[h] + hb - elo[a]) / SCALE_ELO
+        fd      = form.get(h, 0.5) - form.get(a, 0.5)
+        hs, as_ = int(r["home_score"]), int(r["away_score"])
+        outcome = 2 if hs > as_ else (1 if hs == as_ else 0)  # 2=win,1=draw,0=loss
+        rows.append([ed, fd, hs, as_, outcome])
+
+    data   = pd.DataFrame(rows, columns=["elo_diff","form_diff","hg","ag","outcome"])
+    X      = data[["elo_diff","form_diff"]].values
+    y      = data["outcome"].values
+    hg     = data["hg"].values
+    ag     = data["ag"].values
+
+    clf    = LogisticRegression(max_iter=2000, C=1.0).fit(X, y)
+    pois_h = PoissonRegressor(max_iter=500).fit(X, hg)
+    pois_a = PoissonRegressor(max_iter=500).fit(-X, ag)
+
+    return clf, pois_h, pois_a
+
+# ─── 4. MATCH PROBABILITY ENGINE ─────────────────────────────────────────────
+
+class MatchPredictor:
+    """Wraps trained models to answer any binary question about a match."""
+
+    def __init__(self, clf, pois_h, pois_a, elo: dict, form: dict):
+        self.clf    = clf
+        self.pois_h = pois_h
+        self.pois_a = pois_a
+        self.elo    = elo
+        self.form   = form
+
+    def _features(self, home: str, away: str) -> np.ndarray:
+        eh  = self.elo.get(home, ELO_START)
+        ea  = self.elo.get(away, ELO_START)
+        # add host boost if applicable
+        if home in HOSTS:
+            eh += HOME_ELO
+        ed  = (eh - ea) / SCALE_ELO
+        fd  = self.form.get(home, 0.5) - self.form.get(away, 0.5)
+        return np.array([[ed, fd]])
+
+    def win_draw_loss(self, home: str, away: str) -> tuple[float, float, float]:
+        """Returns (p_home_win, p_draw, p_away_win)."""
+        X     = self._features(home, away)
+        proba = self.clf.predict_proba(X)[0]   # [loss, draw, win]
+        return proba[2], proba[1], proba[0]
+
+    def expected_goals(self, home: str, away: str) -> tuple[float, float]:
+        X  = self._features(home, away)
+        gh = float(np.clip(self.pois_h.predict(X)[0], MIN_LAM, MAX_LAM))
+        ga = float(np.clip(self.pois_a.predict(-X)[0], MIN_LAM, MAX_LAM))
+        return gh, ga
+
+    def btts_prob(self, home: str, away: str) -> float:
+        """Both teams to score: P(hg≥1) × P(ag≥1) via Poisson."""
+        gh, ga = self.expected_goals(home, away)
+        p_h_scores = 1 - math.exp(-gh)
+        p_a_scores = 1 - math.exp(-ga)
+        return p_h_scores * p_a_scores
+
+    def over_goals_prob(self, home: str, away: str, line: float = 2.5) -> float:
+        """P(total goals > line) by convolving two Poisson distributions."""
+        gh, ga = self.expected_goals(home, away)
+        threshold = int(math.floor(line))
+        # P(total ≤ threshold) = sum over all combos
+        p_under = 0.0
+        for hg in range(threshold + 1):
+            for ag in range(threshold + 1 - hg):
+                ph = math.exp(-gh) * (gh ** hg) / math.factorial(hg)
+                pa = math.exp(-ga) * (ga ** ag) / math.factorial(ag)
+                p_under += ph * pa
+        return 1 - p_under
+
+    def clean_sheet_prob(self, home: str, away: str) -> float:
+        """P(away scores 0) — home team clean sheet."""
+        _, ga = self.expected_goals(home, away)
+        return math.exp(-ga)
+
+# ─── 5. QUESTION PARSER: map market question → probability ───────────────────
+
+def parse_teams_from_match(match_name: str) -> tuple[str, str]:
+    """'Mexico vs South Africa' → ('Mexico', 'South Africa')"""
+    parts = re.split(r"\s+vs\.?\s+", match_name, flags=re.IGNORECASE)
+    if len(parts) == 2:
+        return parts[0].strip(), parts[1].strip()
+    return "", ""
+
+def predict_market(
+    question: str,
+    match_name: str,
+    predictor: MatchPredictor,
+) -> int | None:
+    """
+    Parse the binary question and return a 1-99 integer probability.
+    Returns None if the question can't be answered by the model alone
+    (those will be sent to Claude).
+    """
+    q    = question.lower().strip()
+    home, away = parse_teams_from_match(match_name)
+    if not home:
+        return None
+
+    # Normalize team name aliases (common FIFA vs casual names)
+    ALIASES = {
+        "united states": "USA",
+        "u.s.": "USA",
+        "south korea": "South Korea",
+        "republic of ireland": "Republic of Ireland",
+        "ivory coast": "Ivory Coast",
+        "côte d'ivoire": "Ivory Coast",
+        "democratic republic of congo": "DR Congo",
+        "cape verde islands": "Cape Verde",
+    }
+    def norm(t):
+        return ALIASES.get(t.lower(), t)
+
+    home = norm(home)
+    away = norm(away)
+
+    pw, pd_, pl = predictor.win_draw_loss(home, away)
+
+    # ── Win / loss patterns ──
+    if re.search(rf"will {re.escape(home.lower())} win", q):
+        return clamp(pw)
+    if re.search(rf"will {re.escape(away.lower())} win", q):
+        return clamp(pl)
+    if re.search(r"will (the match|the game) end in a draw", q):
+        return clamp(pd_)
+    if re.search(r"draw|tie", q) and "regulation" not in q:
+        return clamp(pd_)
+
+    # Win in regulation specifically
+    if re.search(r"win.*regulation", q):
+        if re.search(rf"{re.escape(home.lower())}", q):
+            return clamp(pw)
+        if re.search(rf"{re.escape(away.lower())}", q):
+            return clamp(pl)
+
+    # ── Goals patterns ──
+    over_m = re.search(r"over (\d+\.?\d*) goals?", q)
+    if over_m:
+        line = float(over_m.group(1))
+        return clamp(predictor.over_goals_prob(home, away, line))
+
+    under_m = re.search(r"under (\d+\.?\d*) goals?", q)
+    if under_m:
+        line = float(under_m.group(1))
+        return clamp(1 - predictor.over_goals_prob(home, away, line))
+
+    # Total goals shorthand
+    if re.search(r"more than 2[. ]?5 goals", q) or re.search(r"2[. ]?5\+ goals", q):
+        return clamp(predictor.over_goals_prob(home, away, 2.5))
+    if re.search(r"at least 3 goals", q):
+        return clamp(predictor.over_goals_prob(home, away, 2.5))
+
+    # Both teams to score
+    if re.search(r"both teams? (to )?score", q) or re.search(r"\bbtts\b", q):
+        return clamp(predictor.btts_prob(home, away))
+
+    # Clean sheet
+    if re.search(r"clean sheet", q):
+        if re.search(rf"{re.escape(home.lower())}", q):
+            return clamp(predictor.clean_sheet_prob(home, away))
+        if re.search(rf"{re.escape(away.lower())}", q):
+            return clamp(predictor.clean_sheet_prob(away, home))
+
+    # First half / half-time win (rough: home win prob × 0.7 since leads don't = HT wins)
+    if re.search(r"(half.time|half time|first half).*win", q):
+        if re.search(rf"{re.escape(home.lower())}", q):
+            return clamp(pw * 0.70)
+        if re.search(rf"{re.escape(away.lower())}", q):
+            return clamp(pl * 0.70)
+
+    # Anytime draw probability
+    if "draw" in q:
+        return clamp(pd_)
+
+    return None   # hand off to Claude
 
 
-# ----------------------------------------------------------------------------
-# 4. SIMULATION
-# ----------------------------------------------------------------------------
-class Sim:
-    def __init__(self, clf, pois_h, pois_a, elo, form):
-        teams = [t for g in GROUPS.values() for t in g]
-        self.elo = {t: elo[t] for t in teams}
-        self.form = {t: form.get(t, 0.0) for t in teams}
+def clamp(p: float) -> int:
+    return max(1, min(99, round(p * 100)))
 
-        # Precompute every pairwise matchup once -> sim loop is pure lookups.
-        eff = np.array([self.elo[t] + (HOST_ELO if t in HOSTS else 0.0)
-                        for t in teams])
-        frm = np.array([self.form[t] for t in teams])
-        n = len(teams)
-        ii, jj = np.meshgrid(np.arange(n), np.arange(n), indexing="ij")
-        X = np.column_stack([(eff[ii] - eff[jj]).ravel(),
-                             (frm[ii] - frm[jj]).ravel()])
-        Xs = X / np.array([400.0, 2.0])
-        lam_a = np.clip(pois_h.predict(Xs), 0.15, 4.5).reshape(n, n)
-        lam_b = np.clip(pois_a.predict(-Xs), 0.15, 4.5).reshape(n, n)
-        proba = clf.predict_proba(X)               # cols: loss, draw, win
-        p_win, p_draw, p_loss = proba[:, 2], proba[:, 1], proba[:, 0]
-        ko = p_win + p_draw * (p_win / (p_win + p_loss))  # ET/pens by strength
-        self.idx = {t: k for k, t in enumerate(teams)}
-        self.lam_a, self.lam_b = lam_a, lam_b
-        self.p_ko = ko.reshape(n, n)
+# ─── 6. CLAUDE fallback for unrecognised market questions ────────────────────
 
-    def sample_score(self, a, b):
-        i, j = self.idx[a], self.idx[b]
-        return RNG.poisson(self.lam_a[i, j]), RNG.poisson(self.lam_b[i, j])
+def claude_predict(question: str, match_name: str, home_elo: float, away_elo: float) -> int:
+    """Ask Claude to estimate a probability for questions outside our model."""
+    if not ANT_KEY:
+        return 50   # neutral fallback if no key
 
-    def knockout_winner(self, a, b):
-        return a if RNG.random() < self.p_ko[self.idx[a], self.idx[b]] else b
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANT_KEY)
+        prompt = f"""You are a precise sports probability estimator for the 2026 FIFA World Cup.
 
-    def play_group(self, teams):
-        stats = {t: [0, 0, 0] for t in teams}     # pts, gd, gf
-        for i in range(4):
-            for j in range(i + 1, 4):
-                a, b = teams[i], teams[j]
-                ga, gb = self.sample_score(a, b)
-                stats[a][1] += ga - gb; stats[a][2] += ga
-                stats[b][1] += gb - ga; stats[b][2] += gb
-                if ga > gb:   stats[a][0] += 3
-                elif gb > ga: stats[b][0] += 3
-                else:         stats[a][0] += 1; stats[b][0] += 1
-        order = sorted(teams, key=lambda t: (stats[t][0], stats[t][1],
-                                             stats[t][2], RNG.random()),
-                       reverse=True)
-        return order, stats
+Match: {match_name}
+Home team Elo rating: {home_elo:.0f}
+Away team Elo rating: {away_elo:.0f}
+(Average Elo ≈ 1500. Higher = stronger.)
 
-    @staticmethod
-    def assign_thirds(qualified_groups):
-        """Backtracking match of 8 qualified third-place groups -> 8 slots."""
-        slots = sorted(THIRD_SLOTS, key=lambda s: len(s[1] & qualified_groups))
-        assign, used = {}, set()
+Question: "{question}"
 
-        def bt(i):
-            if i == len(slots):
-                return True
-            match, allowed = slots[i]
-            for g in allowed & qualified_groups - used:
-                used.add(g); assign[match] = g
-                if bt(i + 1):
-                    return True
-                used.discard(g); assign.pop(match)
-            return False
+This is a binary (yes/no) question. Estimate the probability it resolves YES.
+Consider team strength (reflected in Elo), typical World Cup match patterns,
+and any domain knowledge about this specific question type.
 
-        bt(0)
-        return assign
+Reply with ONLY a single integer between 1 and 99 (inclusive). Nothing else."""
 
-    def run_once(self, counts):
-        winners, runners, third_rank = {}, {}, []
-        for g, teams in GROUPS.items():
-            order, stats = self.play_group(teams)
-            winners[g], runners[g] = order[0], order[1]
-            third_rank.append((g, order[2], stats[order[2]]))
+        resp = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=10,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = resp.content[0].text.strip()
+        val = int(re.sub(r"\D", "", raw))
+        return max(1, min(99, val))
 
-        third_rank.sort(key=lambda x: (x[2][0], x[2][1], x[2][2], RNG.random()),
-                        reverse=True)
-        best8 = third_rank[:8]
-        qual_groups = {g for g, _, _ in best8}
-        third_team = {g: t for g, t, _ in best8}
-        slot_map = self.assign_thirds(qual_groups)
+    except Exception as e:
+        print(f"      Claude error ({e}) — using 50")
+        return 50
 
-        in_r32 = set(winners.values()) | set(runners.values()) | set(third_team.values())
-        for t in in_r32:
-            counts[t]["R32"] += 1
+# ─── 7. SPORTSPREDICT API helpers ────────────────────────────────────────────
 
-        def resolve(spec, match):
-            if isinstance(spec, tuple):
-                return third_team[slot_map[match]]
-            kind, g = spec[0], spec[1]
-            return winners[g] if kind == "1" else runners[g]
+def sp_get(path: str, params: dict = None) -> list | dict:
+    resp = requests.get(f"{API}/{path}", headers=HEADERS, params=params or {})
+    if resp.status_code == 401:
+        print("✗ Invalid API key. Set SPORTSPREDICT_KEY and retry.")
+        sys.exit(1)
+    resp.raise_for_status()
+    return resp.json()
 
-        alive = {}
-        for m, (s1, s2) in R32.items():
-            a, b = resolve(s1, m), resolve(s2, m)
-            alive[m] = self.knockout_winner(a, b)
-        for t in alive.values():
-            counts[t]["R16"] += 1
-        for rnd, stage in ((R16, "QF"), (QF, "SF"), (SF, "F")):
-            nxt = {}
-            for m, (m1, m2) in rnd.items():
-                nxt[m] = self.knockout_winner(alive[m1], alive[m2])
-            for t in nxt.values():
-                counts[t][stage] += 1
-            alive = nxt
-        champ = self.knockout_winner(alive[101], alive[102])
-        counts[champ]["W"] += 1
+def sp_post(path: str, body: dict) -> dict:
+    resp = requests.post(f"{API}/{path}", headers=HEADERS, json=body)
+    resp.raise_for_status()
+    return resp.json()
 
+def sp_patch(path: str, body: dict) -> dict:
+    resp = requests.patch(f"{API}/{path}", headers=HEADERS, json=body)
+    resp.raise_for_status()
+    return resp.json()
+
+def bootstrap() -> tuple[str, str]:
+    """Find the Probability Cup event and lobby, auto-join if needed."""
+    print("🔍  Finding Probability Cup …")
+    events = sp_get("events")
+    event  = next((e for e in events if e.get("type") == "probability"), None)
+    if not event:
+        print("✗ No active Probability Cup event found.")
+        sys.exit(1)
+    print(f"   ✓ Event: {event['title']} (id: {event['id'][:8]}…)")
+
+    lobbies = sp_get("lobbies", {"event_id": event["id"]})
+    if not lobbies:
+        print("✗ No lobby found for this event.")
+        sys.exit(1)
+    lobby = lobbies[0]
+
+    if not lobby.get("joined"):
+        print("   Joining lobby …")
+        sp_post(f"lobbies/{lobby['id']}/join", {})
+        print("   ✓ Joined")
+    else:
+        print(f"   ✓ Lobby: {lobby['name']} (already joined)")
+
+    return event["id"], lobby["id"]
+
+def fetch_all_markets(event_id: str, lobby_id: str) -> list[dict]:
+    """Fetch all open markets, one match at a time (avoids >token limits)."""
+    print("📋  Fetching open markets …")
+    matches  = sp_get("matches", {"event_id": event_id, "lobby_id": lobby_id})
+    print(f"   ✓ {len(matches)} matches with open markets")
+
+    all_markets = []
+    for match in matches:
+        mkts = sp_get("markets", {"lobby_id": lobby_id, "match_id": match["id"]})
+        for m in mkts:
+            m["_match_name"] = match["name"]
+            m["_match_id"]   = match["id"]
+        all_markets.extend(mkts)
+        time.sleep(0.05)   # gentle rate limiting
+
+    print(f"   ✓ {len(all_markets)} open markets total")
+    return all_markets
+
+def already_predicted(lobby_id: str) -> set[str]:
+    """Return set of market_ids already predicted (to skip dupes)."""
+    preds = sp_get("predictions", {"lobby_id": lobby_id})
+    return {p["market_id"] for p in preds}
+
+def submit_batch(predictions: list[dict]) -> tuple[int, int]:
+    """Submit up to 50 predictions, return (succeeded, failed)."""
+    if not predictions:
+        return 0, 0
+    resp = sp_post("predictions/batch", {"predictions": predictions})
+    for r in resp.get("results", []):
+        if not r.get("success"):
+            print(f"      ✗ market {r['market_id'][:8]}…: {r.get('error')}")
+    return resp.get("succeeded", 0), resp.get("failed", 0)
+
+# ─── 8. RESULTS / STATUS commands ────────────────────────────────────────────
+
+def show_results(lobby_id: str):
+    results = sp_get("results", {"lobby_id": lobby_id})
+    if not results:
+        print("No settled predictions yet.")
+        return
+
+    total_brier = sum(r["brier_score"] for r in results if r["brier_score"] is not None)
+    avg_brier   = total_brier / len(results)
+
+    print(f"\n{'─'*72}")
+    print(f"  SETTLED RESULTS  ({len(results)} predictions)")
+    print(f"{'─'*72}")
+    for r in sorted(results, key=lambda x: x.get("brier_score") or 0):
+        bs = r.get("brier_score")
+        bs_str = f"{bs:.4f}" if bs is not None else "pending"
+        print(f"  {r['question'][:55]:<55}  p={r['probability_submitted']:>2}  Brier={bs_str}")
+    print(f"{'─'*72}")
+    print(f"  Avg Brier: {avg_brier:.4f}  (crowd avg ~0.25 — lower is better)")
+    print(f"{'─'*72}\n")
+
+def show_status(lobby_id: str):
+    preds = sp_get("predictions", {"lobby_id": lobby_id})
+    open_ = [p for p in preds if p.get("market_status") == "open"]
+    print(f"\n{len(open_)} open predictions still to settle:\n")
+    for p in open_:
+        print(f"  {p['question'][:60]:<60}  p={p['probability']:>2}")
+    print()
+
+# ─── 9. MAIN LOOP ─────────────────────────────────────────────────────────────
 
 def main():
-    clf, pois_h, pois_a, elo, form = build_models()
-    sim = Sim(clf, pois_h, pois_a, elo, form)
+    global DRY_RUN
 
-    stages = ["R32", "R16", "QF", "SF", "F", "W"]
-    counts = {t: dict.fromkeys(stages, 0) for g in GROUPS.values() for t in g}
+    parser = argparse.ArgumentParser(description="Statalysts Probability Cup Bot")
+    parser.add_argument("--dry-run",  action="store_true", help="Print predictions without submitting")
+    parser.add_argument("--results",  action="store_true", help="Show settled results & Brier scores")
+    parser.add_argument("--status",   action="store_true", help="Show open predictions")
+    args = parser.parse_args()
+    DRY_RUN = args.dry_run
 
-    for i in range(N_SIMS):
-        sim.run_once(counts)
-        if (i + 1) % 5000 == 0:
-            print(f"  {i + 1:,} sims done")
+    if not SP_KEY:
+        print("✗  SPORTSPREDICT_KEY not set. Run: export SPORTSPREDICT_KEY=sp_live_...")
+        sys.exit(1)
 
-    out = []
-    for g, teams in GROUPS.items():
-        for t in teams:
-            row = {"team": DISPLAY.get(t, t), "group": g,
-                   "elo": round(sim.elo[t], 1)}
-            row.update({s: round(100 * counts[t][s] / N_SIMS, 1) for s in stages})
-            out.append(row)
-    out.sort(key=lambda r: (-r["W"], -r["F"], -r["SF"], -r["elo"]))
+    # ── Bootstrap ──
+    event_id, lobby_id = bootstrap()
 
-    with open("wc2026_probs.json", "w") as f:
-        json.dump(out, f, indent=1)
+    if args.results:
+        show_results(lobby_id)
+        return
+    if args.status:
+        show_status(lobby_id)
+        return
 
-    print(f"\n{'Team':<24}{'Elo':>7}{'R32':>7}{'R16':>7}{'QF':>7}{'SF':>7}{'Final':>7}{'Champ':>7}")
-    for r in out[:20]:
-        print(f"{r['team']:<24}{r['elo']:>7}{r['R32']:>7}{r['R16']:>7}"
-              f"{r['QF']:>7}{r['SF']:>7}{r['F']:>7}{r['W']:>7}")
+    # ── Train models ──
+    print("\n🧠  Training Elo + ML models …")
+    df            = fetch_match_data()
+    elo, form     = build_elo_ratings(df)
+    clf, ph, pa   = build_models(df, elo, form)
+    predictor     = MatchPredictor(clf, ph, pa, elo, form)
+    print(f"   ✓ Models trained on {len(df):,} matches")
+
+    # ── Fetch markets ──
+    markets      = fetch_all_markets(event_id, lobby_id)
+    skip_ids     = already_predicted(lobby_id)
+    new_markets  = [m for m in markets if m["id"] not in skip_ids]
+    print(f"   {len(skip_ids)} already predicted — {len(new_markets)} new markets to predict\n")
+
+    # ── Score each market ──
+    print("🎯  Generating predictions …\n")
+    predictions  = []
+    model_count  = 0
+    claude_count = 0
+
+    for m in new_markets:
+        match_name = m["_match_name"]
+        question   = m["question"]
+
+        prob = predict_market(question, match_name, predictor)
+        source = "MODEL"
+
+        if prob is None:
+            home, away = parse_teams_from_match(match_name)
+            h_elo = elo.get(home, ELO_START)
+            a_elo = elo.get(away, ELO_START)
+            prob  = claude_predict(question, match_name, h_elo, a_elo)
+            source = "CLAUDE"
+            claude_count += 1
+        else:
+            model_count += 1
+
+        tag = "🤖" if source == "CLAUDE" else "📊"
+        print(f"  {tag} [{source:6}] {match_name:<30}  p={prob:>2}  \"{question[:50]}\"")
+
+        predictions.append({
+            "market_id":  m["id"],
+            "lobby_id":   lobby_id,
+            "probability": prob,
+        })
+
+    print(f"\n  Model: {model_count} | Claude: {claude_count} | Total: {len(predictions)}")
+
+    # ── Submit ──
+    if DRY_RUN:
+        print("\n⚠️   DRY RUN — nothing submitted.")
+        return
+
+    if not predictions:
+        print("\n✅  Nothing new to submit — all markets already predicted.")
+        return
+
+    print(f"\n📤  Submitting {len(predictions)} predictions in batches of {BATCH_SIZE} …")
+    total_ok = 0
+    total_fail = 0
+
+    for i in range(0, len(predictions), BATCH_SIZE):
+        chunk = predictions[i:i+BATCH_SIZE]
+        ok, fail = submit_batch(chunk)
+        total_ok   += ok
+        total_fail += fail
+        batch_num   = i // BATCH_SIZE + 1
+        print(f"   Batch {batch_num}: {ok}/{len(chunk)} succeeded")
+        if i + BATCH_SIZE < len(predictions):
+            time.sleep(RATE_SLEEP)
+
+    print(f"\n✅  Done.  {total_ok} submitted, {total_fail} failed.")
+    print(f"   Check your leaderboard at: https://sportspredict.com/probabilitycup\n")
 
 
 if __name__ == "__main__":
